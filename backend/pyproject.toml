@@ -2,3 +2,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "-m 'not integracion'"
+markers = [
+  "integracion: requiere corpus real, chromadb y/o Ollama; excluida por defecto.",
+]

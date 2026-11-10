@@ -1,0 +1,56 @@
+{
+
+"instructions": [
+"AGENTS.md"
+],
+"agent": {
+"arquitecto": {
+"description": "Analiza el proyecto, propone arquitectura y revisa decisiones. No modifica archivos.",
+"mode": "subagent",
+"prompt": "{file:./.opencode/agents/arquitecto.md}",
+"temperature": 0.1,
+"permission": {
+"edit": "deny",
+"bash": "deny",
+"webfetch": "deny"
+}
+},
+"disenador-web": {
+"description": "Define la interfaz, los componentes y el sistema de diseño. No implementa lógica de negocio.",
+"mode": "subagent",
+"prompt": "{file:./.opencode/agents/disenador-web.md}",
+"temperature": 0.2,
+"permission": {
+"edit": "allow",
+"bash": "deny"
+}
+},
+"desarrollador": {
+"description": "Implementa funcionalidades aprobadas, escribe pruebas y mantiene el código.",
+"mode": "subagent",
+"prompt": "{file:./.opencode/agents/desarrollador.md}",
+"permission": {
+"edit": "allow",
+"bash": "ask"
+}
+},
+"tester": {
+"description": "Revisa cambios, ejecuta pruebas y reporta fallos sin modificar el código.",
+"mode": "subagent",
+"prompt": "{file:./.opencode/agents/tester.md}",
+"temperature": 0.1,
+"permission": {
+"edit": "deny",
+"bash": {
+"*": "deny",
+"pytest *": "allow",
+"python -m pytest *": "allow",
+"npm test *": "allow",
+"npm run test *": "allow",
+"git diff *": "allow",
+"git status *": "allow"
+}
+}
+}
+}
+}

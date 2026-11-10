@@ -9,7 +9,7 @@ usando únicamente los documentos de `documentos-demo/`.
 ## Alcance
 
 Incluye: consultas en lenguaje natural, recuperación de fragmentos documentales,
-respuestas con fuentes y derivación al departamento cuando no hay evidencia.
+respuestas con fuentes y derivación a los canales oficiales cuando no hay evidencia.
 
 No incluye: autenticación de usuarios, trámites oficiales ni firmas, datos
 personales, normativa institucional real.
@@ -25,14 +25,16 @@ Existente:
 - `backend/app/routers/` — capa HTTP (`health.py`, `consulta.py`), sin lógica de negocio.
 - `backend/app/schemas/` — modelos Pydantic de petición/respuesta.
 - `backend/app/config.py` — `Settings`: único punto que lee `.env`.
+- `backend/app/rag.py` — indexación y consulta documental (ChromaDB + Ollama).
 - `backend/tests/` — pytest con `TestClient`; no requieren servicios externos.
-- `backend/requirements.txt` — `chromadb` y `ollama` reservados como comentario (pendientes de integrar).
+- `backend/requirements.txt` — dependencias de la API, incluidos `chromadb` y `ollama`.
 - `frontend/` — React + TypeScript + Vite (npm); proxy de `/api` → http://localhost:8000.
+  Incluye componentes (`AvisoMaterialDidactico`, `ConsultaPanel`), tipos del
+  contrato en `src/types/consulta.ts` y pruebas con Vitest + Testing Library.
 
 Pendiente de crear (aún no existe):
 
 - `documentos-demo/` — corpus ficticio de demostración (raíz del repo).
-- `backend/app/rag.py` — indexación y consulta documental (ChromaDB).
 - `documentacion/` y `prompts/` — raíz del repo.
 
 ## Comandos
@@ -48,25 +50,32 @@ Desde `backend/` — en Windows, invocar `.venv\Scripts\python` directamente
 ```
 
 El venv ya existe en `backend/.venv` (Python 3.11). Frontend: `cd frontend`,
-`npm install`, `npm run dev` (http://localhost:5173).
+`npm install`, `npm run dev` (http://localhost:5173), `npm test` (Vitest) y
+`npm run build`.
 
-Cuando se integre el modelo de IA local, las pruebas que lo ejerciten requerirán
-su servidor activo; un fallo allí suele ser del entorno, no del código.
+Las pruebas que ejerciten el modelo de IA local requieren su servidor activo;
+un fallo allí suele ser del entorno, no del código.
 
 ## Estado actual de la API
 
-- `POST /api/consulta` devuelve un placeholder (`respuesta` fija, `fuentes`
-  vacías): aún sin recuperación documental ni generación con IA.
-- Rutas existentes: `/api/health`, `/api/consulta`.
-- La clave `advertencia` (ver Convenciones) aún no está implementada; se
-  agregará junto con la derivación sin evidencia (regla 3).
+- `POST /api/consulta` recibe `{"pregunta": "..."}` (1–1000 caracteres tras
+  normalizar espacios extremos) y responde con `respuesta`, `fuentes` y
+  `advertencia`.
+- `fuentes` es una lista de objetos `{documento, fragmento}`. `advertencia` es
+  `null` cuando la respuesta está fundamentada.
+- Sin corpus indexado, `POST /api/consulta` responde `503`. Cuando no hay
+  evidencia suficiente, responde `200` con `fuentes` vacío y una `advertencia`
+  que recomienda consultar los canales oficiales de la institución.
+- Rutas existentes: `GET /api/salud` (estado del servicio) y su alias
+  `GET /api/health`.
 
 ## Reglas
 
 1. No inventar requisitos, fechas, montos ni enlaces.
 2. Toda respuesta debe citar al menos un documento de `documentos-demo/`.
 3. Si la recuperación no encuentra evidencia suficiente, responder que no se
-   cuenta con información y recomendar acudir al departamento correspondiente.
+   cuenta con información y recomendar consultar los canales oficiales de la
+   institución.
 4. No modificar `documentos-demo/` para "hacer que una respuesta funcione".
 5. No agregar dependencias sin justificar el motivo y actualizar
    `backend/requirements.txt`.

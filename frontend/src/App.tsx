@@ -1,6 +1,8 @@
 
 import { useState } from 'react'
 import logo from './assets/logo.svg'
+import AvisoMaterialDidactico from './components/AvisoMaterialDidactico'
+import ConsultaPanel from './components/ConsultaPanel'
 
 const features = [
   {
@@ -34,6 +36,8 @@ function App() {
 
   return (
     <>
+      <AvisoMaterialDidactico />
+
       <header className="navbar">
         <div className="nav-container">
           <a href="#" className="brand" aria-label="TecBot Académico">
@@ -57,6 +61,9 @@ function App() {
             </a>
             <a href="#procesos" onClick={() => setMenuOpen(false)}>
               Procesos
+            </a>
+            <a href="#consulta" onClick={() => setMenuOpen(false)}>
+              Consulta
             </a>
             <a href="#recursos" onClick={() => setMenuOpen(false)}>
               Recursos
@@ -118,6 +125,22 @@ function App() {
             <span className="floating-dot dot-two"></span>
             <span className="floating-dot dot-three"></span>
           </div>
+        </section>
+
+        <section className="consulta-section" id="consulta">
+          <div className="section-heading">
+            <span className="section-label">CONSULTA ACADÉMICA</span>
+            <h2>
+              Pregunta sobre tus procesos académicos
+              <span>.</span>
+            </h2>
+            <p>
+              Respuestas basadas únicamente en los documentos de demostración,
+              con las fuentes que las respaldan.
+            </p>
+          </div>
+
+          <ConsultaPanel />
         </section>
 
         <section className="features-section" id="caracteristicas">
