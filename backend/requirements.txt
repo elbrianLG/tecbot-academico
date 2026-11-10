@@ -1,0 +1,12 @@
+# Dependencias del backend (instalar con pip dentro del venv)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic-settings>=2.6
+
+# Desarrollo / pruebas
+pytest>=8.3
+httpx>=0.27
+
+# Se integrarán posteriormente:
+# chromadb
+# ollama

@@ -1,0 +1,25 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Variables de entorno
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+
+# Herramientas
+.vscode/
+.idea/
+.DS_Store
+
+# Datos locales
+backend/data/chroma/
+*.sqlite3
+*.db

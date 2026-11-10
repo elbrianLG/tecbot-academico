@@ -1,0 +1,4 @@
+# Configuración de pytest. Las dependencias se gestionan en requirements.txt.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
