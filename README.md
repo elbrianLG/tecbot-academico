@@ -28,3 +28,11 @@ npm run dev   # http://localhost:5173 — el proxy de /api apunta a :8000
 ## Variables de entorno
 
 Copia `backend/.env.example` a `backend/.env` y ajusta los valores. Nunca subas `.env` al repositorio.
+
+## Control de versiones
+
+El proyecto utiliza Git y GitHub para registrar
+los cambios y mantener un historial de desarrollo.
+
+La rama principal es `main`.
+Las mejoras se trabajan en ramas independientes.
