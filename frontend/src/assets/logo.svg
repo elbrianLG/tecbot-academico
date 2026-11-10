@@ -1,0 +1,16 @@
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 60" fill="none">
+  <defs>
+    <linearGradient id="brand" x1="5" y1="5" x2="55" y2="55">
+      <stop stop-color="#06B6D4"/>
+      <stop offset="1" stop-color="#10B981"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="5" width="50" height="50" rx="15" fill="#151F32" stroke="url(#brand)" stroke-width="2"/>
+  <path d="M15 19H41V36H29L21 43V36H15V19Z" stroke="url(#brand)" stroke-width="2.5" stroke-linejoin="round"/>
+  <circle cx="23" cy="27.5" r="2" fill="#06B6D4"/>
+  <circle cx="29" cy="27.5" r="2" fill="#06B6D4"/>
+  <circle cx="35" cy="27.5" r="2" fill="#10B981"/>
+  <text x="64" y="29" fill="#F1F5F9" font-family="Arial,sans-serif" font-size="19" font-weight="700">TecBot</text>
+  <text x="64" y="45" fill="#06B6D4" font-family="Arial,sans-serif" font-size="11" font-weight="600" letter-spacing="1">ACADÉMICO</text>
+</svg>
