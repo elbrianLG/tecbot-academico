@@ -66,8 +66,10 @@ Si un comando requiere instalar dependencias o modificar el entorno, pide autori
 - Una pregunta no cubierta devuelve una negativa clara y una recomendación, sin inventar datos.
 - La API responde con el contrato esperado.
 - Una entrada vacía o inválida se rechaza con un mensaje comprensible.
-- El servidor MCP rechaza rutas fuera de `documentos-demo/`.
-- El servidor MCP niega operaciones de escritura.
+- El CLI rechaza rutas del corpus con `..` y no modifica `documentos-demo/`.
+- El CLI devuelve 2 sin corpus y 3 sin `chromadb`/`ollama`.
+- La indexación es idempotente y no cambia los hashes del corpus (integración, cuando exista corpus).
+- La consulta sin evidencia responde 200 con `fuentes: []` y los textos exactos de abstención.
 
 ## Formato de entrega
 

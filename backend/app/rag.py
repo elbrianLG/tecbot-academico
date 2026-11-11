@@ -22,6 +22,7 @@ from typing import Any
 from app.config import Settings, get_settings
 from app.constants import (
     ADVERTENCIA_SIN_EVIDENCIA,
+    MAX_REINTENTOS_GENERACION,
     RESPUESTA_SIN_EVIDENCIA,
     TOP_K,
 )
@@ -259,6 +260,25 @@ def _respuesta_sin_evidencia() -> ConsultaResponse:
     )
 
 
+def _es_error_de_tiempo(exc: BaseException) -> bool:
+    """``True`` si la excepción representa un agotamiento del tiempo de espera."""
+
+    return (
+        isinstance(exc, TimeoutError)
+        or "timeout" in str(exc).lower()
+        or "timed out" in str(exc).lower()
+    )
+
+
+def _restante(deadline: float) -> float:
+    """Devuelve el tiempo restante del presupuesto o lanza ``TiempoAgotadoError``."""
+
+    restante = deadline - time.monotonic()
+    if restante <= 0:
+        raise TiempoAgotadoError()
+    return restante
+
+
 # ---------------------------------------------------------------------------
 # Servicio de consulta
 # ---------------------------------------------------------------------------
@@ -292,11 +312,12 @@ class ServicioConsulta:
             ) from exc
         return ollama
 
-    def _cliente_ollama(self) -> Any:
+    def _cliente_ollama(self, timeout: float | None = None) -> Any:
         ollama = self._importar_ollama()
+        tiempo = self.settings.consulta_timeout_s if timeout is None else timeout
         return ollama.Client(
             host=self.settings.ollama_base_url,
-            timeout=self.settings.consulta_timeout_s,
+            timeout=tiempo,
         )
 
     # -- manifiesto -------------------------------------------------------------
@@ -324,12 +345,39 @@ class ServicioConsulta:
             encoding="utf-8",
         )
 
+    def documentos_indexados(self) -> dict[str, str]:
+        """Devuelve ``{nombre: contenido}`` de los archivos que coinciden con el manifiesto.
+
+        Compara el ``sha256`` de los bytes actuales (igual que
+        ``calcular_manifiesto``) para evitar falsos negativos por CRLF o BOM.
+        Los archivos nuevos o modificados desde la indexación se excluyen, y sin
+        manifiesto el resultado es ``{}``.
+        """
+
+        manifiesto = self.manifiesto_guardado()
+        if manifiesto is None:
+            return {}
+
+        documentos: dict[str, str] = {}
+        for archivo in listar_archivos(self.settings.corpus_dir):
+            hash_actual = hashlib.sha256(archivo.read_bytes()).hexdigest()
+            if manifiesto.get(archivo.name) != hash_actual:
+                continue
+            documentos[archivo.name] = archivo.read_text(encoding="utf-8")
+        return documentos
+
     # -- estado -----------------------------------------------------------------
 
     def esta_indexado(self) -> bool:
-        """``True`` solo si hay corpus, ``chromadb`` y una colección con datos."""
+        """``True`` solo si hay corpus, manifiesto, ``chromadb`` y datos.
+
+        Un índice sin manifiesto no es trazable contra el corpus actual, por lo
+        que se considera no indexado (la API responde 503).
+        """
 
         if not listar_archivos(self.settings.corpus_dir):
+            return False
+        if self.manifiesto_guardado() is None:
             return False
         if not self.settings.chroma_dir.exists():
             return False
@@ -430,14 +478,33 @@ class ServicioConsulta:
 
     # -- recuperación -----------------------------------------------------------
 
-    def recuperar(self, pregunta: str, top_k: int = TOP_K) -> list[FragmentoRecuperado]:
-        """Recupera los fragmentos más cercanos a la pregunta."""
+    def recuperar(
+        self,
+        pregunta: str,
+        top_k: int = TOP_K,
+        *,
+        deadline: float | None = None,
+        indexado: bool | None = None,
+    ) -> list[FragmentoRecuperado]:
+        """Recupera los fragmentos más cercanos a la pregunta.
 
-        if not self.esta_indexado():
+        ``deadline`` es el instante absoluto (``time.monotonic``) en que vence
+        la consulta. Si se omite, se calcula uno propio con
+        ``settings.consulta_timeout_s``. ``indexado`` permite reutilizar el
+        resultado de ``esta_indexado()`` ya calculado por quien llama; si se
+        omite, se evalúa aquí.
+        """
+
+        if deadline is None:
+            deadline = time.monotonic() + self.settings.consulta_timeout_s
+
+        if indexado is None:
+            indexado = self.esta_indexado()
+        if not indexado:
             raise CorpusNoIndexadoError()
 
         chromadb = self._importar_chromadb()
-        cliente_ollama = self._cliente_ollama()
+        cliente_ollama = self._cliente_ollama(timeout=_restante(deadline))
 
         try:
             respuesta = cliente_ollama.embed(
@@ -445,7 +512,14 @@ class ServicioConsulta:
                 input=[pregunta],
             )
             embedding = respuesta["embeddings"][0]
+        except Exception as exc:
+            if _es_error_de_tiempo(exc):
+                raise TiempoAgotadoError() from exc
+            raise ServicioNoDisponibleError(
+                "No fue posible recuperar fragmentos del corpus."
+            ) from exc
 
+        try:
             cliente = chromadb.PersistentClient(path=str(self.settings.chroma_dir))
             coleccion = cliente.get_collection(COLECCION)
             n_resultados = max(1, min(top_k, coleccion.count()))
@@ -458,6 +532,8 @@ class ServicioConsulta:
             raise ServicioNoDisponibleError(
                 "No fue posible recuperar fragmentos del corpus."
             ) from exc
+
+        _restante(deadline)
 
         ids = (resultado.get("ids") or [[]])[0]
         documentos = (resultado.get("documents") or [[]])[0]
@@ -483,12 +559,22 @@ class ServicioConsulta:
 
     # -- generación -------------------------------------------------------------
 
-    def _generar(
+    def _intentar_generar(
         self,
         pregunta: str,
         recuperadas: list[FragmentoRecuperado],
+        *,
+        timeout: float,
     ) -> dict[str, Any]:
-        cliente = self._cliente_ollama()
+        """Hace UNA llamada a Ollama y valida la forma de la salida.
+
+        Lanza ``GeneracionInvalidaError`` cuando el modelo devuelve algo que no
+        cumple el contrato (JSON inválido, ``respuesta`` vacía, ``citas`` que no
+        es lista, etc.). Los errores de transporte se traducen a
+        ``TiempoAgotadoError`` o ``ServicioNoDisponibleError``.
+        """
+
+        cliente = self._cliente_ollama(timeout=timeout)
         contexto = "\n\n".join(
             f"[{fragmento.id}] Documento: {fragmento.documento}\n{fragmento.fragmento}"
             for fragmento in recuperadas
@@ -509,7 +595,7 @@ class ServicioConsulta:
                 options={"temperature": 0},
             )
         except Exception as exc:
-            if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+            if _es_error_de_tiempo(exc):
                 raise TiempoAgotadoError() from exc
             raise ServicioNoDisponibleError(
                 "Ollama no pudo generar la respuesta."
@@ -524,41 +610,81 @@ class ServicioConsulta:
             datos = json.loads(contenido)
         except (json.JSONDecodeError, TypeError) as exc:
             raise GeneracionInvalidaError() from exc
+
         if not isinstance(datos, dict):
+            raise GeneracionInvalidaError()
+        if "sin_evidencia" in datos and not isinstance(datos["sin_evidencia"], bool):
+            raise GeneracionInvalidaError()
+        if datos.get("sin_evidencia") is True:
+            # La abstención puede venir sin ``respuesta`` ni ``citas``.
+            return datos
+        if not isinstance(datos.get("respuesta"), str) or not datos["respuesta"].strip():
+            raise GeneracionInvalidaError()
+        if not isinstance(datos.get("citas"), list):
             raise GeneracionInvalidaError()
         return datos
 
-    def _verificar_tiempo(self, inicio: float) -> None:
-        if time.monotonic() - inicio > self.settings.consulta_timeout_s:
-            raise TiempoAgotadoError()
+    def _generar(
+        self,
+        pregunta: str,
+        recuperadas: list[FragmentoRecuperado],
+        *,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """Genera la respuesta reintentando solo salidas con forma inválida.
+
+        No reintenta ``TiempoAgotadoError``, ``ServicioNoDisponibleError`` ni
+        ``CorpusNoIndexadoError``. Antes de cada reintento comprueba que quede
+        presupuesto en ``deadline``.
+        """
+
+        max_intentos = 1 + MAX_REINTENTOS_GENERACION
+        for intento in range(1, max_intentos + 1):
+            timeout = _restante(deadline)
+            try:
+                return self._intentar_generar(
+                    pregunta,
+                    recuperadas,
+                    timeout=timeout,
+                )
+            except GeneracionInvalidaError:
+                if intento >= max_intentos:
+                    raise
+                # Verifica el presupuesto antes de volver a llamar a Ollama.
+                _restante(deadline)
+
+        raise GeneracionInvalidaError()  # pragma: no cover - inalcanzable
 
     def consultar(self, pregunta: str) -> ConsultaResponse:
         """Responde la pregunta con base en el corpus indexado."""
 
-        if not self.esta_indexado():
+        deadline = time.monotonic() + self.settings.consulta_timeout_s
+
+        indexado = self.esta_indexado()
+        if not indexado:
             raise CorpusNoIndexadoError()
 
-        inicio = time.monotonic()
-        recuperadas = self.recuperar(pregunta, top_k=TOP_K)
-        self._verificar_tiempo(inicio)
+        recuperadas = self.recuperar(
+            pregunta,
+            top_k=TOP_K,
+            deadline=deadline,
+            indexado=indexado,
+        )
+        _restante(deadline)
 
         if not recuperadas:
             return _respuesta_sin_evidencia()
 
-        datos = self._generar(pregunta, recuperadas)
-        self._verificar_tiempo(inicio)
+        datos = self._generar(pregunta, recuperadas, deadline=deadline)
+        _restante(deadline)
 
         if datos.get("sin_evidencia") is True:
             return _respuesta_sin_evidencia()
 
-        respuesta = datos.get("respuesta")
-        citas = datos.get("citas")
-        if not isinstance(respuesta, str) or not respuesta.strip():
-            raise GeneracionInvalidaError()
-        if not isinstance(citas, list):
-            raise GeneracionInvalidaError()
+        respuesta = datos["respuesta"]
+        citas = datos["citas"]
 
-        documentos = cargar_documentos(self.settings.corpus_dir)
+        documentos = self.documentos_indexados()
         fuentes = validar_fuentes(
             [str(cita) for cita in citas],
             recuperadas,

@@ -32,7 +32,7 @@ Implementar incrementos pequeños y aprobados, con pruebas y documentación sufi
 - No agregues dependencias sin justificar el motivo y actualizar `requirements.txt`.
 - No incluyas credenciales, tokens, datos personales ni archivos `.env`.
 - Mantén las respuestas de la API con el contrato acordado: `respuesta`, `fuentes`, `advertencia`.
-- Si no hay evidencia suficiente, la aplicación debe decirlo y recomendar acudir al departamento correspondiente.
+- Si no hay evidencia suficiente, la aplicación debe decirlo y recomendar consultar los canales oficiales de la institución.
 
 ## Después de editar
 

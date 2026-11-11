@@ -1,14 +1,25 @@
 """Pruebas unitarias de las utilidades RAG (sin chromadb ni Ollama)."""
 
+import json
 from pathlib import Path
 
 import pytest
 
 from app.config import Settings
-from app.constants import ADVERTENCIA_SIN_EVIDENCIA, RESPUESTA_SIN_EVIDENCIA
+from app.constants import (
+    ADVERTENCIA_SIN_EVIDENCIA,
+    MAX_REINTENTOS_GENERACION,
+    RESPUESTA_SIN_EVIDENCIA,
+)
 from app.rag import (
+    NOMBRE_MANIFIESTO,
+    CorpusNoIndexadoError,
     FragmentoRecuperado,
+    GeneracionInvalidaError,
     ServicioConsulta,
+    ServicioNoDisponibleError,
+    TiempoAgotadoError,
+    calcular_manifiesto,
     extraer_datos_sensibles,
     normalizar_texto,
     respuesta_respaldada,
@@ -231,9 +242,11 @@ def _servicio_con_dobles(
     )
     monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
     monkeypatch.setattr(
-        servicio, "recuperar", lambda pregunta, top_k=3: [recuperada]
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
     )
-    monkeypatch.setattr("app.rag.cargar_documentos", lambda _: DOCUMENTOS)
+    monkeypatch.setattr(servicio, "documentos_indexados", lambda: DOCUMENTOS)
     return servicio
 
 
@@ -248,7 +261,7 @@ def test_consultar_devuelve_fuentes_validadas(
     monkeypatch.setattr(
         servicio,
         "_generar",
-        lambda pregunta, recuperadas: {
+        lambda pregunta, recuperadas, deadline=None: {
             "sin_evidencia": False,
             "respuesta": "Se requiere haber cubierto el 70% de los créditos.",
             "citas": ["a"],
@@ -273,7 +286,7 @@ def test_consultar_abstiene_si_la_respuesta_inventa_datos(
     monkeypatch.setattr(
         servicio,
         "_generar",
-        lambda pregunta, recuperadas: {
+        lambda pregunta, recuperadas, deadline=None: {
             "sin_evidencia": False,
             "respuesta": "El costo es de 500 pesos y vence en 2026.",
             "citas": ["a"],
@@ -298,7 +311,7 @@ def test_consultar_abstiene_si_todas_las_citas_son_invalidas(
     monkeypatch.setattr(
         servicio,
         "_generar",
-        lambda pregunta, recuperadas: {
+        lambda pregunta, recuperadas, deadline=None: {
             "sin_evidencia": False,
             "respuesta": "Respuesta sin respaldo.",
             "citas": ["desconocida"],
@@ -353,9 +366,808 @@ def test_recuperar_no_filtra_por_score(
     )
     monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
     monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
-    monkeypatch.setattr(servicio, "_cliente_ollama", lambda: _OllamaFalso())
+    monkeypatch.setattr(
+        servicio, "_cliente_ollama", lambda timeout=None: _OllamaFalso()
+    )
 
     fragmentos = servicio.recuperar("pregunta", top_k=3)
 
     assert len(fragmentos) == 3
     assert [fragmento.distancia for fragmento in fragmentos] == [0.91, 0.97, 0.99]
+
+
+# ---------------------------------------------------------------------------
+# Errores de tiempo en la recuperación (F-1)
+# ---------------------------------------------------------------------------
+
+
+class _OllamaQueFalla:
+    """Cliente de embeddings que siempre lanza la excepción indicada."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.llamadas = 0
+
+    def embed(self, model: str, input: list[str]) -> dict[str, object]:
+        self.llamadas += 1
+        raise self.error
+
+
+def test_recuperar_timeout_de_embeddings_es_tiempo_agotado(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    cliente = _OllamaQueFalla(TimeoutError("timed out"))
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio.recuperar("pregunta")
+
+    assert cliente.llamadas == 1
+
+
+def test_recuperar_timeout_sin_mensaje_es_tiempo_agotado(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    cliente = _OllamaQueFalla(TimeoutError())
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio.recuperar("pregunta")
+
+    assert cliente.llamadas == 1
+
+
+def test_recuperar_error_de_conexion_sigue_siendo_servicio_no_disponible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    cliente = _OllamaQueFalla(ConnectionError("connection refused"))
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(ServicioNoDisponibleError):
+        servicio.recuperar("pregunta")
+
+    assert cliente.llamadas == 1
+
+
+def test_recuperar_con_indexado_explicito_no_recalcula(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servicio = _servicio_rag(tmp_path)
+    llamadas: list[bool] = []
+
+    def esta_indexado() -> bool:
+        llamadas.append(True)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    monkeypatch.setattr(
+        servicio, "_cliente_ollama", lambda timeout=None: _OllamaFalso()
+    )
+
+    fragmentos = servicio.recuperar("pregunta", top_k=3, indexado=True)
+
+    assert len(fragmentos) == 3
+    assert llamadas == []
+
+
+def test_recuperar_con_indexado_falso_no_consulta_dependencias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servicio = _servicio_rag(tmp_path)
+    llamadas: list[bool] = []
+
+    def esta_indexado() -> bool:
+        llamadas.append(True)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+
+    with pytest.raises(CorpusNoIndexadoError):
+        servicio.recuperar("pregunta", indexado=False)
+
+    assert llamadas == []
+
+
+def test_recuperar_sin_indexado_explicito_lanza_corpus_no_indexado(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Sin ``indexado`` explícito, ``recuperar`` evalúa el estado una sola vez.
+
+    Con el corpus no indexado debe abortar antes de importar Chroma o crear el
+    cliente de Ollama; los dobles registran cualquier acceso para demostrarlo.
+    """
+
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    llamadas: list[bool] = []
+    dependencias: list[str] = []
+
+    def esta_indexado() -> bool:
+        llamadas.append(True)
+        return False
+
+    def importar_chromadb() -> object:
+        dependencias.append("chromadb")
+        raise AssertionError("no debe importar chromadb")
+
+    def cliente_ollama(timeout: float | None = None) -> object:
+        dependencias.append("ollama")
+        raise AssertionError("no debe crear el cliente de Ollama")
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    monkeypatch.setattr(servicio, "_importar_chromadb", importar_chromadb)
+    monkeypatch.setattr(servicio, "_cliente_ollama", cliente_ollama)
+
+    with pytest.raises(CorpusNoIndexadoError):
+        servicio.recuperar("pregunta")
+
+    assert llamadas == [True]
+    assert dependencias == []
+
+
+class _ChromaQueFalla:
+    """Doble de ``chromadb`` cuyo cliente persistente siempre falla."""
+
+    def PersistentClient(self, path: str) -> object:
+        raise RuntimeError("chroma caido")
+
+
+def test_recuperar_error_de_chroma_es_servicio_no_disponible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Un fallo de Chroma al abrir el índice se traduce en 503, no en 504.
+
+    Se hace fallar ``PersistentClient`` (no ``get_collection``) para cubrir el
+    punto donde ``recuperar`` abre el índice. El error no es de tiempo, así que
+    debe mapearse a ``ServicioNoDisponibleError`` y no a ``TiempoAgotadoError``.
+    """
+
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaQueFalla())
+    monkeypatch.setattr(
+        servicio, "_cliente_ollama", lambda timeout=None: _OllamaFalso()
+    )
+
+    with pytest.raises(ServicioNoDisponibleError) as excinfo:
+        servicio.recuperar("pregunta")
+
+    assert not isinstance(excinfo.value, TiempoAgotadoError)
+
+
+
+# ---------------------------------------------------------------------------
+# Documentos indexados contra el manifiesto (CA-29)
+# ---------------------------------------------------------------------------
+
+
+def _crear_corpus(tmp_path: Path, documentos: dict[str, str]) -> Path:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for nombre, contenido in documentos.items():
+        (corpus / nombre).write_text(contenido, encoding="utf-8")
+    return corpus
+
+
+def _guardar_manifiesto_temporal(
+    chroma_dir: Path,
+    corpus: Path,
+    documentos: dict[str, str] | None = None,
+) -> None:
+    chroma_dir.mkdir(parents=True, exist_ok=True)
+    manifiesto = documentos if documentos is not None else calcular_manifiesto(corpus)
+    (chroma_dir / NOMBRE_MANIFIESTO).write_text(
+        json.dumps({"version": 1, "documentos": manifiesto}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_documentos_indexados_solo_incluye_hash_coincidente(tmp_path: Path) -> None:
+    corpus = _crear_corpus(
+        tmp_path,
+        {"a.md": "Contenido A.", "b.md": "Contenido B."},
+    )
+    chroma = tmp_path / "chroma"
+    manifiesto = calcular_manifiesto(corpus)
+    manifiesto.pop("b.md")
+    _guardar_manifiesto_temporal(chroma, corpus, manifiesto)
+
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+
+    assert servicio.documentos_indexados() == {"a.md": "Contenido A."}
+
+
+def test_documentos_indexados_excluye_documento_nuevo(tmp_path: Path) -> None:
+    corpus = _crear_corpus(tmp_path, {"a.md": "Contenido A."})
+    chroma = tmp_path / "chroma"
+    _guardar_manifiesto_temporal(chroma, corpus)
+    (corpus / "nuevo.md").write_text("Documento nuevo.", encoding="utf-8")
+
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+
+    assert servicio.documentos_indexados() == {"a.md": "Contenido A."}
+
+
+def test_documentos_indexados_excluye_documento_modificado(tmp_path: Path) -> None:
+    corpus = _crear_corpus(tmp_path, {"a.md": "Contenido original."})
+    chroma = tmp_path / "chroma"
+    _guardar_manifiesto_temporal(chroma, corpus)
+    (corpus / "a.md").write_text("Contenido modificado.", encoding="utf-8")
+
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+
+    assert servicio.documentos_indexados() == {}
+
+
+def test_documentos_indexados_sin_manifiesto_es_vacio(tmp_path: Path) -> None:
+    corpus = _crear_corpus(tmp_path, {"a.md": "Contenido A."})
+    servicio = ServicioConsulta(
+        Settings(corpus_dir=corpus, chroma_dir=tmp_path / "chroma")
+    )
+
+    assert servicio.documentos_indexados() == {}
+
+
+def test_consultar_no_cita_documento_fuera_del_manifiesto(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    corpus = _crear_corpus(
+        tmp_path,
+        {
+            "servicio-social.md": DOCUMENTOS["servicio-social.md"],
+            "otro.md": "Contenido del documento no indexado.",
+        },
+    )
+    chroma = tmp_path / "chroma"
+    manifiesto = calcular_manifiesto(corpus)
+    manifiesto.pop("otro.md")
+    _guardar_manifiesto_temporal(chroma, corpus, manifiesto)
+
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    recuperada = _fragmento("a", "otro.md", "Contenido del documento no indexado.")
+    monkeypatch.setattr(
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
+    )
+    monkeypatch.setattr(
+        servicio,
+        "_generar",
+        lambda pregunta, recuperadas, deadline=None: {
+            "sin_evidencia": False,
+            "respuesta": "Contenido del documento no indexado.",
+            "citas": ["a"],
+        },
+    )
+
+    resultado = servicio.consultar("Pregunta")
+
+    assert resultado.respuesta == RESPUESTA_SIN_EVIDENCIA
+    assert resultado.fuentes == []
+    assert resultado.advertencia == ADVERTENCIA_SIN_EVIDENCIA
+
+
+def test_consultar_no_cita_documento_modificado(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    corpus = _crear_corpus(
+        tmp_path,
+        {"servicio-social.md": DOCUMENTOS["servicio-social.md"]},
+    )
+    chroma = tmp_path / "chroma"
+    _guardar_manifiesto_temporal(chroma, corpus)
+    (corpus / "servicio-social.md").write_text(
+        "Texto distinto al que se indexó.",
+        encoding="utf-8",
+    )
+
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    recuperada = _fragmento(
+        "a", "servicio-social.md", "haber cubierto el 70% de los créditos"
+    )
+    monkeypatch.setattr(
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
+    )
+    monkeypatch.setattr(
+        servicio,
+        "_generar",
+        lambda pregunta, recuperadas, deadline=None: {
+            "sin_evidencia": False,
+            "respuesta": "Se requiere haber cubierto el 70% de los créditos.",
+            "citas": ["a"],
+        },
+    )
+
+    resultado = servicio.consultar("Pregunta")
+
+    assert resultado.respuesta == RESPUESTA_SIN_EVIDENCIA
+    assert resultado.fuentes == []
+    assert resultado.advertencia == ADVERTENCIA_SIN_EVIDENCIA
+
+
+def test_esta_indexado_false_sin_manifiesto(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    corpus = _crear_corpus(tmp_path, {"a.md": "Contenido A."})
+    chroma = tmp_path / "chroma"
+    chroma.mkdir()
+    servicio = ServicioConsulta(Settings(corpus_dir=corpus, chroma_dir=chroma))
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+
+    assert servicio.esta_indexado() is False
+
+
+# ---------------------------------------------------------------------------
+# Reintento de generación (CA-25)
+# ---------------------------------------------------------------------------
+
+
+class _RelojFalso:
+    """Reloj monotónico controlable para pruebas deterministas."""
+
+    def __init__(self, inicio: float = 1000.0) -> None:
+        self.ahora = inicio
+
+    def monotonic(self) -> float:
+        return self.ahora
+
+    def avanzar(self, segundos: float) -> None:
+        self.ahora += segundos
+
+
+class _ClienteChatFalso:
+    """Cliente de chat que devuelve salidas en orden (o lanza excepciones)."""
+
+    def __init__(self, salidas: list[object]) -> None:
+        self.salidas = list(salidas)
+        self.llamadas = 0
+
+    def chat(self, **kwargs: object) -> dict[str, object]:
+        self.llamadas += 1
+        salida = self.salidas.pop(0)
+        if isinstance(salida, Exception):
+            raise salida
+        return {"message": {"content": salida}}
+
+
+def _servicio_rag(tmp_path: Path) -> ServicioConsulta:
+    return ServicioConsulta(
+        Settings(corpus_dir=tmp_path, chroma_dir=tmp_path / "chroma")
+    )
+
+
+def test_generar_reintenta_tras_una_salida_invalida(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    cliente = _ClienteChatFalso(
+        [
+            "esto no es json",
+            json.dumps(
+                {
+                    "sin_evidencia": False,
+                    "respuesta": "Respuesta válida.",
+                    "citas": ["a"],
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    datos = servicio._generar(
+        "pregunta",
+        [_fragmento("a", "d.md", "fragmento")],
+        deadline=reloj.ahora + 12,
+    )
+
+    assert datos["respuesta"] == "Respuesta válida."
+    assert cliente.llamadas == 1 + MAX_REINTENTOS_GENERACION
+
+
+def test_generar_falla_tras_agotar_los_reintentos(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    cliente = _ClienteChatFalso(
+        [
+            "esto no es json",
+            json.dumps({"respuesta": "", "citas": []}),
+        ]
+    )
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(GeneracionInvalidaError):
+        servicio._generar(
+            "pregunta",
+            [_fragmento("a", "d.md", "fragmento")],
+            deadline=reloj.ahora + 12,
+        )
+
+    assert cliente.llamadas == 1 + MAX_REINTENTOS_GENERACION
+
+
+def test_generar_no_reintenta_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    cliente = _ClienteChatFalso([TimeoutError("timed out")])
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio._generar(
+            "pregunta",
+            [_fragmento("a", "d.md", "fragmento")],
+            deadline=reloj.ahora + 12,
+        )
+
+    assert cliente.llamadas == 1
+
+
+def test_generar_no_reintenta_error_de_conexion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    cliente = _ClienteChatFalso([ConnectionError("connection refused")])
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(ServicioNoDisponibleError):
+        servicio._generar(
+            "pregunta",
+            [_fragmento("a", "d.md", "fragmento")],
+            deadline=reloj.ahora + 12,
+        )
+
+    assert cliente.llamadas == 1
+
+
+def test_consultar_sin_evidencia_no_reintenta(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    recuperada = _fragmento("a", "d.md", "fragmento")
+    monkeypatch.setattr(
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
+    )
+    monkeypatch.setattr(servicio, "documentos_indexados", lambda: {"d.md": "fragmento"})
+    cliente = _ClienteChatFalso(
+        [
+            json.dumps(
+                {
+                    "sin_evidencia": True,
+                    "respuesta": "No hay evidencia suficiente.",
+                    "citas": [],
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    resultado = servicio.consultar("Pregunta")
+
+    assert resultado.advertencia == ADVERTENCIA_SIN_EVIDENCIA
+    assert cliente.llamadas == 1
+
+
+def test_consultar_abstiene_con_salida_minima_sin_evidencia(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    monkeypatch.setattr(servicio, "esta_indexado", lambda: True)
+    recuperada = _fragmento("a", "d.md", "fragmento")
+    monkeypatch.setattr(
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
+    )
+    cliente = _ClienteChatFalso([json.dumps({"sin_evidencia": True})])
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    resultado = servicio.consultar("Pregunta")
+
+    assert resultado.respuesta == RESPUESTA_SIN_EVIDENCIA
+    assert resultado.fuentes == []
+    assert resultado.advertencia == ADVERTENCIA_SIN_EVIDENCIA
+    assert cliente.llamadas == 1
+
+
+def test_generar_no_reintenta_si_el_presupuesto_se_agoto(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+
+    class _ClienteAgotaPresupuesto:
+        def __init__(self) -> None:
+            self.llamadas = 0
+
+        def chat(self, **kwargs: object) -> dict[str, object]:
+            self.llamadas += 1
+            reloj.avanzar(13)
+            return {"message": {"content": "esto no es json"}}
+
+    cliente = _ClienteAgotaPresupuesto()
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio._generar(
+            "pregunta",
+            [_fragmento("a", "d.md", "fragmento")],
+            deadline=reloj.ahora + 12,
+        )
+
+    assert cliente.llamadas == 1
+
+
+# ---------------------------------------------------------------------------
+# Deadline global de 12 s (RNF-01)
+# ---------------------------------------------------------------------------
+
+
+def test_recuperar_usa_el_restante_como_timeout_de_embeddings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+
+    def esta_indexado() -> bool:
+        reloj.avanzar(10)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    timeouts: list[float | None] = []
+
+    def construir_cliente(timeout: float | None = None) -> _OllamaFalso:
+        timeouts.append(timeout)
+        return _OllamaFalso()
+
+    monkeypatch.setattr(servicio, "_cliente_ollama", construir_cliente)
+
+    servicio.recuperar("pregunta", top_k=3)
+
+    assert timeouts == pytest.approx([2.0])
+
+
+def test_generar_usa_el_restante_como_timeout_de_chat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    timeouts: list[float | None] = []
+    cliente = _ClienteChatFalso(
+        [
+            json.dumps(
+                {
+                    "sin_evidencia": False,
+                    "respuesta": "Respuesta.",
+                    "citas": [],
+                }
+            )
+        ]
+    )
+
+    def construir_cliente(timeout: float | None = None) -> _ClienteChatFalso:
+        timeouts.append(timeout)
+        return cliente
+
+    monkeypatch.setattr(servicio, "_cliente_ollama", construir_cliente)
+    deadline = reloj.ahora + 12
+    reloj.avanzar(10)
+
+    servicio._generar("pregunta", [], deadline=deadline)
+
+    assert timeouts == pytest.approx([2.0])
+
+
+def test_restante_agotado_no_llama_al_cliente(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    timeouts: list[float | None] = []
+    monkeypatch.setattr(
+        servicio,
+        "_cliente_ollama",
+        lambda timeout=None: timeouts.append(timeout),
+    )
+    deadline = reloj.ahora + 12
+    reloj.avanzar(12)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio._generar("pregunta", [], deadline=deadline)
+
+    assert timeouts == []
+
+
+def test_reintento_no_concede_mas_de_doce_segundos(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    timeouts: list[float | None] = []
+
+    class _ClienteConsumeTodo:
+        def __init__(self) -> None:
+            self.llamadas = 0
+
+        def chat(self, **kwargs: object) -> dict[str, object]:
+            self.llamadas += 1
+            reloj.avanzar(12)
+            return {"message": {"content": "esto no es json"}}
+
+    cliente = _ClienteConsumeTodo()
+
+    def construir_cliente(timeout: float | None = None) -> _ClienteConsumeTodo:
+        timeouts.append(timeout)
+        return cliente
+
+    monkeypatch.setattr(servicio, "_cliente_ollama", construir_cliente)
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio._generar("pregunta", [], deadline=reloj.ahora + 12)
+
+    assert sum(t for t in timeouts if t is not None) <= 12.0
+    assert cliente.llamadas == 1
+
+
+def test_el_tiempo_de_esta_indexado_consume_presupuesto(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+
+    def esta_indexado() -> bool:
+        reloj.avanzar(13)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    monkeypatch.setattr(servicio, "recuperar", lambda *args, **kwargs: [])
+
+    with pytest.raises(TiempoAgotadoError):
+        servicio.consultar("pregunta")
+
+
+# ---------------------------------------------------------------------------
+# Una sola evaluación de esta_indexado por consulta (F-2)
+# ---------------------------------------------------------------------------
+
+
+def test_consultar_evalua_esta_indexado_una_sola_vez(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    llamadas: list[bool] = []
+
+    def esta_indexado() -> bool:
+        llamadas.append(True)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    recuperada = _fragmento(
+        "a", "servicio-social.md", "haber cubierto el 70% de los créditos"
+    )
+    monkeypatch.setattr(
+        servicio,
+        "recuperar",
+        lambda pregunta, top_k=3, deadline=None, indexado=None: [recuperada],
+    )
+    monkeypatch.setattr(servicio, "documentos_indexados", lambda: DOCUMENTOS)
+    cliente = _ClienteChatFalso(
+        [
+            json.dumps(
+                {
+                    "sin_evidencia": False,
+                    "respuesta": "Se requiere haber cubierto el 70% de los créditos.",
+                    "citas": ["a"],
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(servicio, "_cliente_ollama", lambda timeout=None: cliente)
+
+    resultado = servicio.consultar("Pregunta")
+
+    assert len(llamadas) == 1
+    assert resultado.advertencia is None
+
+
+def test_consultar_con_recuperar_real_evalua_esta_indexado_una_sola_vez(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """F-2 con la recuperación real: una sola evaluación de ``esta_indexado``.
+
+    A diferencia de ``test_consultar_evalua_esta_indexado_una_sola_vez``, aquí
+    NO se reemplaza ``recuperar`` por un doble, por lo que la prueba es sensible
+    a la regresión que motivó F-2. Con el código anterior ``consultar`` evaluaba
+    ``esta_indexado()`` y luego ``recuperar`` (al no recibir ``indexado``) lo
+    volvía a evaluar: el contador habría valido 2 y esta prueba habría fallado.
+    """
+
+    reloj = _RelojFalso()
+    monkeypatch.setattr("app.rag.time.monotonic", reloj.monotonic)
+    servicio = _servicio_rag(tmp_path)
+    llamadas: list[bool] = []
+
+    def esta_indexado() -> bool:
+        llamadas.append(True)
+        return True
+
+    monkeypatch.setattr(servicio, "esta_indexado", esta_indexado)
+    monkeypatch.setattr(servicio, "_importar_chromadb", lambda: _ChromaFalso())
+    monkeypatch.setattr(
+        servicio, "_cliente_ollama", lambda timeout=None: _OllamaFalso()
+    )
+    # Aísla la generación: la consulta termina en abstención sin llamar al chat.
+    monkeypatch.setattr(
+        servicio, "_generar", lambda *args, **kwargs: {"sin_evidencia": True}
+    )
+
+    resultado = servicio.consultar("pregunta")
+
+    assert len(llamadas) == 1
+    assert resultado.advertencia == ADVERTENCIA_SIN_EVIDENCIA
+

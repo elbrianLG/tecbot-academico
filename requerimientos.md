@@ -31,7 +31,7 @@ Incluye consultas sobre servicio social, residencias, titulación, acreditación
 | RF-07 | Recomendar consultar los canales oficiales de la institución cuando no haya evidencia suficiente, sin mencionar departamentos no documentados. | Alta |
 | RF-08 | Mostrar estados de carga y error. | Media |
 | RF-09 | Mostrar aviso de material didáctico. | Alta |
-| RF-10 | Exponer `GET /salud`. | Media |
+| RF-10 | Exponer `GET /api/salud` (alias `GET /api/health`). | Media |
 
 ## 5. Requerimientos no funcionales
 

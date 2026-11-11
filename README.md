@@ -14,12 +14,36 @@ cd backend
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python -m app.rag indexar                   # requiere documentos-demo/ y Ollama
+.venv\Scripts\python -m app.rag indexar --reindex         # fuerza la reindexación
 .venv\Scripts\python -m uvicorn app.main:app --reload     # http://localhost:8000
-.venv\Scripts\python -m pytest                            # pruebas
+.venv\Scripts\python -m pytest                            # pruebas unitarias (integración excluida)
+.venv\Scripts\python -m pytest -m integracion -rs         # integración (ver más abajo)
 ```
 
 El comando `python -m app.rag indexar` requiere que exista `documentos-demo/`
-y que Ollama esté activo.
+y que Ollama esté activo. Si el corpus no cambió desde la última indexación no
+hace nada; `--reindex` fuerza el proceso aunque los hashes coincidan.
+
+Modelos locales por defecto (definidos en `backend/app/config.py`):
+
+```bash
+ollama pull nomic-embed-text   # embeddings
+ollama pull llama3.2           # generación de respuestas
+```
+
+Códigos de salida de `python -m app.rag indexar`:
+
+| Código | Significado |
+|---|---|
+| `0` | Éxito: corpus indexado, o sin cambios desde la última indexación. |
+| `2` | Error de corpus: no existe `documentos-demo/`, no contiene archivos `.md` o la ruta incluye `..`. |
+| `3` | Faltan dependencias (`chromadb`/`ollama`) o Ollama no responde o no tiene el modelo de embeddings. |
+
+Las pruebas de integración requieren `documentos-demo/` con documentos `.md`,
+`chromadb` y `ollama` instalados, el servidor de Ollama activo y, para los casos
+de consulta cubierta, preguntas acordadas con el responsable del corpus. La
+suite por defecto **no** ejecuta integración: `backend/pyproject.toml` aplica
+`-m 'not integracion'`.
 
 ## Endpoints
 
@@ -46,6 +70,14 @@ npm run build   # compilación de producción
 ## Variables de entorno
 
 Copia `backend/.env.example` a `backend/.env` y ajusta los valores. Nunca subas `.env` al repositorio.
+
+- `DEBUG=false`: con `DEBUG=true`, Starlette usa su `debug_response` y omite el
+  manejador de excepciones; eso rompe el contrato de error `{error, mensaje}` y
+  puede exponer la traza al cliente.
+- `CORS_ORIGINS` debe ser un arreglo JSON, no una lista separada por comas:
+  `CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]`.
+- `CORPUS_DIR` es opcional; por defecto apunta a `documentos-demo/` en la raíz
+  del repositorio. Si se define, no puede contener `..`.
 
 ## Control de versiones
 
